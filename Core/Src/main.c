@@ -31,6 +31,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include <stdio.h>
+#include <math.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -66,6 +67,14 @@ volatile int16_t gyro_x, gyro_y, gyro_z;
 long temperature, pressure;
 uint8_t buffer[6];
 
+float ax, ay, az;
+float roll, pitch;
+
+// gyro bias offsets
+int16_t gyro_x_bias = 0;
+int16_t gyro_y_bias = 0;
+int16_t gyro_z_bias = 0;
+
 
 
 /* USER CODE END PV */
@@ -86,6 +95,10 @@ static void MX_USART1_UART_Init(void);
 #define LCD_BL 0x08 // Bit 3. When this bit is 1, backlight turns on.
 #define LCD_EN 0x04 // Bit 2. This is read now signal for LCD.
 #define LCD_RS 0x01 // Bit 0. When 0 = sending command.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
 
 void lcd_send_nibble(uint8_t nibble, uint8_t rs) // This sends 4 bits to the LCD.
 {
@@ -222,6 +235,33 @@ void bmp180_get_temp_pressure(long *temp, long *pressure)
     *pressure = *pressure + ((X1 + X2 + 3791) >> 4);  // pressure in Pa
 }
 
+void calibrate_gyro(void)
+{
+    int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+
+    lcd_set_cursor(0, 0);
+    lcd_string("Calibrating...");
+    lcd_set_cursor(1, 0);
+    lcd_string("Keep still!");
+
+    for (int i = 0; i < 100; i++)
+    {
+        HAL_I2C_Mem_Read(&hi2c1, 0x68 << 1, 0x43, 1, buffer, 6, 100);
+        gx_sum += (int16_t)((buffer[0] << 8) | buffer[1]);
+        gy_sum += (int16_t)((buffer[2] << 8) | buffer[3]);
+        gz_sum += (int16_t)((buffer[4] << 8) | buffer[5]);
+        HAL_Delay(10);
+    }
+
+    gyro_x_bias = gx_sum / 100;
+    gyro_y_bias = gy_sum / 100;
+    gyro_z_bias = gz_sum / 100;
+
+    lcd_cmd(0x01);
+    HAL_Delay(5);
+}
+
+
 
 void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
   {
@@ -330,6 +370,8 @@ int main(void)
   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, 1, &data, 1, 100);
   HAL_Delay(100);
 
+  calibrate_gyro();
+
   // Read BMP180 calibration
   bmp180_read_calibration();
 
@@ -340,13 +382,14 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  	i2c_rx_done = 0;
-	    HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x3B, 1, buffer, 6);
-	    while (!i2c_rx_done); // wait DMA to read the data.
+	  i2c_rx_done = 0;
+	      HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x3B, 1, buffer, 6);
+	      while (!i2c_rx_done);
 
 	      accel_x = (buffer[0] << 8) | buffer[1];
 	      accel_y = (buffer[2] << 8) | buffer[3];
 	      accel_z = (buffer[4] << 8) | buffer[5];
+
 
 	      if (accel_x == 0 && accel_y == 0 && accel_z == 0)
 	      {
@@ -354,26 +397,36 @@ int main(void)
 	          HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, 1, &wake, 1, 100);
 	          HAL_Delay(50);
 	      }
+
 	      i2c_rx_done = 0;
 	      HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x43, 1, buffer, 6);
 	      while (!i2c_rx_done);
-	      gyro_x = (buffer[0] << 8) | buffer[1];
-	      gyro_y = (buffer[2] << 8) | buffer[3];
-	      gyro_z = (buffer[4] << 8) | buffer[5];
+
+	      gyro_x = ((buffer[0] << 8) | buffer[1]) - gyro_x_bias;
+	      gyro_y = ((buffer[2] << 8) | buffer[3]) - gyro_y_bias;
+	      gyro_z = ((buffer[4] << 8) | buffer[5]) - gyro_z_bias;
+
+	      // Calculate pitch and roll
+	      float ax = accel_x / 16384.0f;
+	      float ay = accel_y / 16384.0f;
+	      float az = accel_z / 16384.0f;
+
+	      roll  = atan2f(ay, az) * 180.0f / 3.14159f;
+	      pitch = atan2f(-ax, sqrtf(ay*ay + az*az)) * 180.0f / 3.14159f;
 
 	      bmp180_get_temp_pressure(&temperature, &pressure);
 
 	      char line[17];
 
 	      lcd_set_cursor(0, 0);
-	      sprintf(line, "T:%ld.%ldC P:%ld", temperature/10, temperature%10, pressure/100);
+	      sprintf(line, "R:%+6.1f P:%+5.1f", roll, pitch);
 	      lcd_string(line);
 
 	      lcd_set_cursor(1, 0);
-	      sprintf(line, "A:%+06d %+06d", accel_x, accel_y);
+	      sprintf(line, "T:%ld.%ldC P:%ld", temperature/10, temperature%10, pressure/100);
 	      lcd_string(line);
 
-	      HAL_Delay(500);
+	      HAL_Delay(200);
 
 
     /* USER CODE END WHILE */
