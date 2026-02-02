@@ -61,6 +61,11 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 volatile uint8_t i2c_rx_done = 0;
+volatile int16_t accel_x, accel_y, accel_z;
+volatile int16_t gyro_x, gyro_y, gyro_z;
+long temperature, pressure;
+uint8_t buffer[6];
+
 
 
 /* USER CODE END PV */
@@ -263,13 +268,6 @@ int main(void)
   uint8_t data = 0x00;
   HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, 1, &data, 1, 100);
   HAL_Delay(100);
-
-  // Variables for sensor data
-  volatile int16_t accel_x, accel_y, accel_z;
-  volatile int16_t gyro_x, gyro_y, gyro_z;
-  uint8_t buffer[6];
-
-  long temperature, pressure;
 
   // Init LCD
   lcd_init();
