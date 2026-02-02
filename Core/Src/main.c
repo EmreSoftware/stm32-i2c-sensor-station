@@ -68,13 +68,18 @@ long temperature, pressure;
 uint8_t buffer[6];
 
 float ax, ay, az;
-float roll, pitch;
+float roll = 0, pitch = 0, yaw = 0;
 
 // gyro bias offsets
 int16_t gyro_x_bias = 0;
 int16_t gyro_y_bias = 0;
 int16_t gyro_z_bias = 0;
 
+// Quaternion
+float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+
+// Madgwick filter parameter
+#define BETA 0.1f  // Lower = smoother but slower, Higher = faster but noisier aka accel trust rate.
 
 
 /* USER CODE END PV */
@@ -98,7 +103,6 @@ static void MX_USART1_UART_Init(void);
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
 #endif
-
 
 void lcd_send_nibble(uint8_t nibble, uint8_t rs) // This sends 4 bits to the LCD.
 {
@@ -268,6 +272,89 @@ void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
       i2c_rx_done = 1;
   }
 
+void madgwick_update(float gx, float gy, float gz, float ax, float ay, float az, float dt)
+{
+    float recipNorm;
+    float s0, s1, s2, s3;
+    float qDot1, qDot2, qDot3, qDot4;
+    float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
+
+    // Convert gyro from degrees/sec to radians/sec
+    gx *= 0.0174533f;
+    gy *= 0.0174533f;
+    gz *= 0.0174533f;
+
+    // Rate of change of quaternion from gyroscope
+    qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
+    qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
+    qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
+
+    // Compute feedback only if accelerometer measurement valid
+    if (!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f)))
+    {
+        // Normalise accelerometer measurement
+        recipNorm = 1.0f / sqrtf(ax * ax + ay * ay + az * az);
+        ax *= recipNorm;
+        ay *= recipNorm;
+        az *= recipNorm;
+
+        // Auxiliary variables to avoid repeated arithmetic
+        _2q0 = 2.0f * q0;
+        _2q1 = 2.0f * q1;
+        _2q2 = 2.0f * q2;
+        _2q3 = 2.0f * q3;
+        _4q0 = 4.0f * q0;
+        _4q1 = 4.0f * q1;
+        _4q2 = 4.0f * q2;
+        _8q1 = 8.0f * q1;
+        _8q2 = 8.0f * q2;
+        q0q0 = q0 * q0;
+        q1q1 = q1 * q1;
+        q2q2 = q2 * q2;
+        q3q3 = q3 * q3;
+
+        // Gradient descent algorithm corrective step
+        s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+        s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+        s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+        s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
+
+        // Normalise step magnitude
+        recipNorm = 1.0f / sqrtf(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3);
+        s0 *= recipNorm;
+        s1 *= recipNorm;
+        s2 *= recipNorm;
+        s3 *= recipNorm;
+
+        // Apply feedback step
+        qDot1 -= BETA * s0;
+        qDot2 -= BETA * s1;
+        qDot3 -= BETA * s2;
+        qDot4 -= BETA * s3;
+    }
+
+    // Integrate rate of change of quaternion to yield quaternion
+    q0 += qDot1 * dt;
+    q1 += qDot2 * dt;
+    q2 += qDot3 * dt;
+    q3 += qDot4 * dt;
+
+    // Normalise quaternion
+    recipNorm = 1.0f / sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 *= recipNorm;
+    q1 *= recipNorm;
+    q2 *= recipNorm;
+    q3 *= recipNorm;
+}
+
+void get_euler_angles(float *roll, float *pitch, float *yaw)
+{
+    *roll  = atan2f(2.0f * (q0 * q1 + q2 * q3), 1.0f - 2.0f * (q1 * q1 + q2 * q2)) * 180.0f / M_PI;
+    *pitch = asinf(2.0f * (q0 * q2 - q3 * q1)) * 180.0f / M_PI;
+    *yaw   = atan2f(2.0f * (q0 * q3 + q1 * q2), 1.0f - 2.0f * (q2 * q2 + q3 * q3)) * 180.0f / M_PI;
+}
+
 
 /* USER CODE END 0 */
 
@@ -382,51 +469,56 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  i2c_rx_done = 0;
-	      HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x3B, 1, buffer, 6);
-	      while (!i2c_rx_done);
+	    i2c_rx_done = 0;
+	    HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x3B, 1, buffer, 6);
+	    while (!i2c_rx_done);
 
-	      accel_x = (buffer[0] << 8) | buffer[1];
-	      accel_y = (buffer[2] << 8) | buffer[3];
-	      accel_z = (buffer[4] << 8) | buffer[5];
+	    accel_x = (buffer[0] << 8) | buffer[1];
+	    accel_y = (buffer[2] << 8) | buffer[3];
+	    accel_z = (buffer[4] << 8) | buffer[5];
 
+	    if (accel_x == 0 && accel_y == 0 && accel_z == 0)
+	    {
+	        uint8_t wake = 0x00;
+	        HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, 1, &wake, 1, 100);
+	        HAL_Delay(50);
+	    }
 
-	      if (accel_x == 0 && accel_y == 0 && accel_z == 0)
-	      {
-	          uint8_t wake = 0x00;
-	          HAL_I2C_Mem_Write(&hi2c1, 0x68 << 1, 0x6B, 1, &wake, 1, 100);
-	          HAL_Delay(50);
-	      }
+	    i2c_rx_done = 0;
+	    HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x43, 1, buffer, 6);
+	    while (!i2c_rx_done);
 
-	      i2c_rx_done = 0;
-	      HAL_I2C_Mem_Read_DMA(&hi2c1, 0x68 << 1, 0x43, 1, buffer, 6);
-	      while (!i2c_rx_done);
+	    gyro_x = ((buffer[0] << 8) | buffer[1]) - gyro_x_bias;
+	    gyro_y = ((buffer[2] << 8) | buffer[3]) - gyro_y_bias;
+	    gyro_z = ((buffer[4] << 8) | buffer[5]) - gyro_z_bias;
 
-	      gyro_x = ((buffer[0] << 8) | buffer[1]) - gyro_x_bias;
-	      gyro_y = ((buffer[2] << 8) | buffer[3]) - gyro_y_bias;
-	      gyro_z = ((buffer[4] << 8) | buffer[5]) - gyro_z_bias;
+	    // Convert to physical units
+	    float ax = accel_x / 16384.0f;  // g
+	    float ay = accel_y / 16384.0f;
+	    float az = accel_z / 16384.0f;
+	    float gx = gyro_x / 131.0f;     // deg/s
+	    float gy = gyro_y / 131.0f;
+	    float gz = gyro_z / 131.0f;
 
-	      // Calculate pitch and roll
-	      float ax = accel_x / 16384.0f;
-	      float ay = accel_y / 16384.0f;
-	      float az = accel_z / 16384.0f;
+	    // Update Madgwick filter (dt = 0.01 for 100Hz, adjust if needed)
+	    madgwick_update(gx, gy, gz, ax, ay, az, 0.01f);
 
-	      roll  = atan2f(ay, az) * 180.0f / 3.14159f;
-	      pitch = atan2f(-ax, sqrtf(ay*ay + az*az)) * 180.0f / 3.14159f;
+	    // Get angles
+	    get_euler_angles(&roll, &pitch, &yaw);
 
-	      bmp180_get_temp_pressure(&temperature, &pressure);
+	    bmp180_get_temp_pressure(&temperature, &pressure);
 
-	      char line[17];
+	    char line[17];
 
-	      lcd_set_cursor(0, 0);
-	      sprintf(line, "R:%+6.1f P:%+5.1f", roll, pitch);
-	      lcd_string(line);
+	    lcd_set_cursor(0, 0);
+	    sprintf(line, "R:%+5.0f P:%+5.0f", roll, pitch);
+	    lcd_string(line);
 
-	      lcd_set_cursor(1, 0);
-	      sprintf(line, "T:%ld.%ldC P:%ld", temperature/10, temperature%10, pressure/100);
-	      lcd_string(line);
+	    lcd_set_cursor(1, 0);
+	    sprintf(line, "Y:%+5.0f T:%ld.%ld", yaw, temperature/10, temperature%10);
+	    lcd_string(line);
 
-	      HAL_Delay(200);
+	    HAL_Delay(10);  // ~100Hz update rate
 
 
     /* USER CODE END WHILE */
